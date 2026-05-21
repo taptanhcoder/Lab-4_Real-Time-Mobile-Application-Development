@@ -8,20 +8,34 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.core.content.edit
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.scale
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
 
 class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(context, attrs), SurfaceHolder.Callback {
+    private enum class GameState {
+        MENU,
+        PLAYING,
+        GAME_OVER,
+        VICTORY
+    }
+
     private data class Star(val xRatio: Float, val yRatio: Float, val radius: Float, val alpha: Int)
 
     private var thread: GameThread? = null
     private val firingObjects = mutableListOf<FiringObject>()
     private val opponents = mutableListOf<Opponent>()
+    private val startButtonRect = RectF()
+    private val replayButtonRect = RectF()
+    private val menuButtonRect = RectF()
     private val gameManager = GameManager(context)
     private val backgroundBitmap: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.galaxy_background)
     private var backgroundScaledBitmap: Bitmap? = null
@@ -35,14 +49,15 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
     }
 
     private val prefs = context.getSharedPreferences("lab4_game", Context.MODE_PRIVATE)
-    private val shipBitmap = createShipBitmap(116, 116)
-    private val bossBitmap = createBossBitmap(220, 150)
+    private val shipBitmap = createShipBitmap()
+    private val bossBitmap = createBossBitmap()
     private val boss = Boss(0f, 136f, bossBitmap, speed = 4.2f, initialHealth = 35)
 
     private var score: Int = 0
     private var highScore: Int = prefs.getInt(KEY_HIGH_SCORE, 0)
     private var lives: Int = STARTING_LIVES
-    private var gameOver: Boolean = false
+    private var escapedEnemies: Int = 0
+    private var gameState: GameState = GameState.MENU
     private var opponentBaseSpeed = 4.5f
     private var firingObjectBaseSpeed = 18f
     private var bossSpawnTimer = 0
@@ -61,6 +76,36 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
         color = Color.rgb(255, 86, 110)
         textSize = 88f
         textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    private val victoryPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(105, 244, 174)
+        textSize = 88f
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 78f
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    private val menuTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(218, 230, 255)
+        textSize = 34f
+        textAlign = Paint.Align.CENTER
+    }
+    private val buttonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(78, 204, 255)
+    }
+    private val secondaryButtonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(92, 108, 145)
+    }
+    private val buttonTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(8, 13, 34)
+        textSize = 34f
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
     }
     private val overlayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(170, 4, 8, 22)
@@ -69,6 +114,9 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
 
     private val bulletLevel: Int
         get() = (score / 60 + 1).coerceIn(1, MAX_BULLET_LEVEL)
+
+    private val bulletCount: Int
+        get() = bulletLevel * 2 - 1
 
     private val playerY: Float
         get() = height - 118f
@@ -80,7 +128,7 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         if (playerX == 0f) {
-            playerX = width / 2f
+            playerX = clampPlayerX(width / 2f)
         }
         thread = GameThread(holder, this).also {
             it.running = true
@@ -89,8 +137,8 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        backgroundScaledBitmap = Bitmap.createScaledBitmap(backgroundBitmap, width, height, true)
-        playerX = if (playerX == 0f) width / 2f else playerX.coerceIn(0f, width.toFloat())
+        backgroundScaledBitmap = backgroundBitmap.scale(width, height)
+        playerX = clampPlayerX(if (playerX == 0f) width / 2f else playerX)
         boss.reset(width)
     }
 
@@ -111,7 +159,7 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
 
     @Synchronized
     fun update() {
-        if (gameOver) return
+        if (gameState != GameState.PLAYING) return
 
         updateDifficulty()
         updateBoss()
@@ -125,34 +173,60 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
     override fun draw(canvas: Canvas) {
         super.draw(canvas)
         drawBackground(canvas)
+
+        if (gameState == GameState.MENU) {
+            drawMenu(canvas)
+            return
+        }
+
         boss.draw(canvas)
         opponents.forEach { it.draw(canvas) }
         firingObjects.forEach { it.draw(canvas) }
         drawShip(canvas)
         drawHud(canvas)
 
-        if (gameOver) {
-            drawGameOver(canvas)
+        if (gameState == GameState.GAME_OVER || gameState == GameState.VICTORY) {
+            drawEndGame(canvas)
         }
     }
 
+    @Synchronized
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.action != MotionEvent.ACTION_DOWN && event.action != MotionEvent.ACTION_MOVE) {
             return super.onTouchEvent(event)
         }
 
-        if (gameOver) {
+        if (event.action == MotionEvent.ACTION_DOWN) {
+            performClick()
+        }
+
+        if (gameState == GameState.MENU) {
+            if (event.action == MotionEvent.ACTION_DOWN && isStartButtonTouched(event.x, event.y)) {
+                startGame()
+            }
+            return true
+        }
+
+        if (isEndGameState()) {
             if (event.action == MotionEvent.ACTION_DOWN) {
-                resetGame()
+                when {
+                    isReplayButtonTouched(event.x, event.y) -> startGame()
+                    isMenuButtonTouched(event.x, event.y) -> showMenu()
+                }
                 return true
             }
             return true
         }
 
-        playerX = event.x.coerceIn(0f, width.toFloat())
+        playerX = clampPlayerX(event.x)
         if (event.action == MotionEvent.ACTION_DOWN) {
             fireBullets()
         }
+        return true
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
         return true
     }
 
@@ -194,7 +268,7 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
                 if (boss.isDead()) {
                     score += 100
                     saveHighScore()
-                    boss.reset(width, extraHealth = score / 20)
+                    finishGame(GameState.VICTORY)
                 }
                 continue
             }
@@ -221,11 +295,10 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
         if (escapedOpponents.isEmpty()) return
 
         opponents.removeAll(escapedOpponents.toSet())
-        lives -= escapedOpponents.size
-        if (lives <= 0) {
-            lives = 0
-            gameOver = true
-            saveHighScore()
+        escapedEnemies += escapedOpponents.size
+        lives = (STARTING_LIVES - escapedEnemies).coerceAtLeast(0)
+        if (escapedEnemies >= MAX_ESCAPED_ENEMIES) {
+            finishGame(GameState.GAME_OVER)
         }
     }
 
@@ -243,13 +316,13 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
     }
 
     private fun fireBullets() {
-        val count = bulletLevel
+        val count = bulletCount
         val center = (count - 1) / 2f
         val startY = playerY - shipBitmap.height / 2f + 18f
 
         for (index in 0 until count) {
             val spreadOffset = index - center
-            val velocityX = spreadOffset * 5.6f
+            val velocityX = spreadOffset * BULLET_SPREAD_SPEED
             firingObjects.add(
                 FiringObject(
                     x = playerX,
@@ -283,39 +356,136 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
 
     private fun drawHud(canvas: Canvas) {
         canvas.drawText("Score: $score", 34f, 56f, hudPaint)
-        canvas.drawText("High: $highScore", 34f, 104f, hudPaint)
+        canvas.drawText("High Score: $highScore", 34f, 104f, hudPaint)
         canvas.drawText("Lives: $lives", width - 190f, 56f, hudPaint)
         canvas.drawText("Level: $bulletLevel", width - 190f, 104f, hudPaint)
+        canvas.drawText("Missed: $escapedEnemies/$MAX_ESCAPED_ENEMIES", 34f, 152f, hudPaint)
     }
 
-    private fun drawGameOver(canvas: Canvas) {
+    private fun drawMenu(canvas: Canvas) {
+        updateMenuButtonBounds()
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), overlayPaint)
-        canvas.drawText("Game Over", width / 2f, height / 2f - 24f, gameOverPaint)
-        canvas.drawText("Tap to restart", width / 2f, height / 2f + 44f, hintPaint)
+        canvas.drawText("Lab 4 Shooter", width / 2f, height * 0.30f, titlePaint)
+        canvas.drawBitmap(
+            shipBitmap,
+            width / 2f - shipBitmap.width / 2f,
+            height * 0.36f,
+            null
+        )
+        canvas.drawText("High Score: $highScore", width / 2f, height * 0.52f, menuTextPaint)
+        drawButton(canvas, startButtonRect, "START", buttonPaint)
+    }
+
+    private fun drawEndGame(canvas: Canvas) {
+        updateGameOverButtonBounds()
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), overlayPaint)
+        if (gameState == GameState.VICTORY) {
+            canvas.drawText("Victory", width / 2f, height / 2f - 110f, victoryPaint)
+        } else {
+            canvas.drawText("Game Over", width / 2f, height / 2f - 110f, gameOverPaint)
+        }
+        canvas.drawText("Score: $score", width / 2f, height / 2f - 44f, hintPaint)
+        canvas.drawText("High Score: $highScore", width / 2f, height / 2f + 8f, hintPaint)
+        drawButton(canvas, replayButtonRect, "PLAY AGAIN", buttonPaint)
+        drawButton(canvas, menuButtonRect, "MENU", secondaryButtonPaint)
+    }
+
+    private fun drawButton(canvas: Canvas, rect: RectF, label: String, paint: Paint) {
+        canvas.drawRoundRect(rect, 18f, 18f, paint)
+        val centerY = rect.centerY() - (buttonTextPaint.descent() + buttonTextPaint.ascent()) / 2f
+        canvas.drawText(label, rect.centerX(), centerY, buttonTextPaint)
+    }
+
+    private fun isStartButtonTouched(x: Float, y: Float): Boolean {
+        updateMenuButtonBounds()
+        return startButtonRect.contains(x, y)
+    }
+
+    private fun isReplayButtonTouched(x: Float, y: Float): Boolean {
+        updateGameOverButtonBounds()
+        return replayButtonRect.contains(x, y)
+    }
+
+    private fun isMenuButtonTouched(x: Float, y: Float): Boolean {
+        updateGameOverButtonBounds()
+        return menuButtonRect.contains(x, y)
+    }
+
+    private fun updateMenuButtonBounds() {
+        setCenteredButton(startButtonRect, height * 0.64f, BUTTON_WIDTH, BUTTON_HEIGHT)
+    }
+
+    private fun updateGameOverButtonBounds() {
+        setCenteredButton(replayButtonRect, height / 2f + 92f, BUTTON_WIDE_WIDTH, BUTTON_HEIGHT)
+        setCenteredButton(menuButtonRect, height / 2f + 184f, BUTTON_WIDTH, BUTTON_HEIGHT)
+    }
+
+    private fun setCenteredButton(rect: RectF, centerY: Float, buttonWidth: Float, buttonHeight: Float) {
+        val centerX = width / 2f
+        rect.set(
+            centerX - buttonWidth / 2f,
+            centerY - buttonHeight / 2f,
+            centerX + buttonWidth / 2f,
+            centerY + buttonHeight / 2f
+        )
+    }
+
+    private fun startGame() {
+        resetGame()
+        gameState = GameState.PLAYING
+    }
+
+    private fun showMenu() {
+        resetGame()
+        gameState = GameState.MENU
+    }
+
+    private fun isEndGameState(): Boolean {
+        return gameState == GameState.GAME_OVER || gameState == GameState.VICTORY
+    }
+
+    private fun finishGame(resultState: GameState) {
+        saveHighScore()
+        firingObjects.clear()
+        opponents.clear()
+        gameState = resultState
     }
 
     private fun resetGame() {
         score = 0
         lives = STARTING_LIVES
+        escapedEnemies = 0
         opponentBaseSpeed = 4.5f
         firingObjectBaseSpeed = 18f
         bossSpawnTimer = 0
-        playerX = width / 2f
+        playerX = clampPlayerX(width / 2f)
         firingObjects.clear()
         opponents.clear()
         boss.reset(width)
-        gameOver = false
     }
 
     private fun saveHighScore() {
         if (score > highScore) {
             highScore = score
-            prefs.edit().putInt(KEY_HIGH_SCORE, highScore).apply()
+            prefs.edit {
+                putInt(KEY_HIGH_SCORE, highScore)
+            }
         }
     }
 
-    private fun createShipBitmap(width: Int, height: Int): Bitmap {
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    private fun clampPlayerX(rawX: Float): Float {
+        val halfShipWidth = shipBitmap.width / 2f
+        if (width <= shipBitmap.width) {
+            return width / 2f
+        }
+
+        return rawX.coerceIn(halfShipWidth, width - halfShipWidth)
+    }
+
+    private fun createShipBitmap(): Bitmap {
+        val width = SHIP_WIDTH
+        val height = SHIP_HEIGHT
+        val bitmap = createBitmap(width, height)
         val canvas = Canvas(bitmap)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         val body = Path()
@@ -336,8 +506,10 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
         return bitmap
     }
 
-    private fun createBossBitmap(width: Int, height: Int): Bitmap {
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    private fun createBossBitmap(): Bitmap {
+        val width = BOSS_WIDTH
+        val height = BOSS_HEIGHT
+        val bitmap = createBitmap(width, height)
         val canvas = Canvas(bitmap)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
@@ -364,7 +536,16 @@ class GameView(context: Context, attrs: AttributeSet? = null) : SurfaceView(cont
 
     companion object {
         private const val STARTING_LIVES = 3
+        private const val MAX_ESCAPED_ENEMIES = STARTING_LIVES
         private const val MAX_BULLET_LEVEL = 5
+        private const val BULLET_SPREAD_SPEED = 4.4f
+        private const val BUTTON_WIDTH = 260f
+        private const val BUTTON_WIDE_WIDTH = 340f
+        private const val BUTTON_HEIGHT = 74f
+        private const val SHIP_WIDTH = 116
+        private const val SHIP_HEIGHT = 116
+        private const val BOSS_WIDTH = 220
+        private const val BOSS_HEIGHT = 150
         private const val KEY_HIGH_SCORE = "high_score"
     }
 }

@@ -4,6 +4,7 @@ import android.graphics.Canvas
 import android.view.SurfaceHolder
 
 class GameThread(private val surfaceHolder: SurfaceHolder, private val gameView: GameView) : Thread() {
+    @Volatile
     var running: Boolean = false
     private val targetFPS = 60
 
@@ -20,8 +21,12 @@ class GameThread(private val surfaceHolder: SurfaceHolder, private val gameView:
                 canvas = surfaceHolder.lockCanvas()
                 canvas?.let {
                     synchronized(surfaceHolder) {
-                        gameView.update()
-                        gameView.draw(it)
+                        try {
+                            gameView.update()
+                            gameView.draw(it)
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
                     }
                 }
             } finally {
